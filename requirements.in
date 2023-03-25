@@ -1,0 +1,10 @@
+attrs
+beautifulsoup4
+black
+isort
+Mastodon.py
+pip-tools
+python-dateutil
+requests
+rich
+typer
