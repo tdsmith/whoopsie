@@ -1,23 +1,32 @@
 import datetime
 import re
 import sqlite3
-import tomllib
 from pathlib import Path
 from textwrap import dedent
 from typing import Self
 
+import atproto
 import attr
 import bs4
 import dateutil.tz
 import mastodon
 import requests
+import tomllib
 import typer
+from atproto_client.models.app.bsky.embed import external as bsky_card_model
 
 
 @attr.frozen()
 class PendingToot:
     event_id: str
     content: str
+
+
+@attr.frozen()
+class PendingSkeet:
+    event_id: str
+    content: str
+    link: str
 
 
 @attr.define()
@@ -63,6 +72,14 @@ CREATE TABLE IF NOT EXISTS toots (
     pending INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS skeets (
+    event_id TEXT UNIQUE NOT NULL,
+    timestamp TEXT DEFAULT CURRENT_TIMESTAMP NOT NULL,
+    content TEXT NOT NULL,
+    link TEXT NOT NULL,
+    pending INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS urls (
     url TEXT NOT NULL UNIQUE,
     visited TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
@@ -102,6 +119,26 @@ class BotStore:
             content=row[1],
         )
 
+    def next_skeet(self) -> PendingSkeet | None:
+        with self.connection:
+            cursor = self.connection.execute(
+                """\
+                SELECT event_id, content, link
+                FROM skeets
+                WHERE pending
+                ORDER BY timestamp ASC
+                LIMIT 1
+            """
+            )
+            row = cursor.fetchone()
+        if not row:
+            return None
+        return PendingSkeet(
+            event_id=row[0],
+            content=row[1],
+            link=row[2],
+        )
+
     def last_visit(self, url: str) -> datetime.datetime | None:
         with self.connection:
             cursor = self.connection.execute(
@@ -137,6 +174,22 @@ class BotStore:
                 [dict(event_id=toot.event_id, content=toot.content) for toot in toots],
             )
 
+    def save_skeets(self, skeets: list[PendingSkeet]):
+        with self.connection:
+            self.connection.executemany(
+                """\
+                INSERT OR IGNORE INTO skeets
+                (event_id, content, link, pending)
+                VALUES(:event_id, :content, :link, TRUE)
+                """,
+                [
+                    dict(
+                        event_id=skeet.event_id, content=skeet.content, link=skeet.link
+                    )
+                    for skeet in skeets
+                ],
+            )
+
     def record_toot(self, toot: PendingToot):
         with self.connection:
             self.connection.execute(
@@ -146,6 +199,17 @@ class BotStore:
                 WHERE event_id = ?
             """,
                 (toot.event_id,),
+            )
+
+    def record_skeet(self, skeet: PendingSkeet):
+        with self.connection:
+            self.connection.execute(
+                """\
+                UPDATE skeets
+                SET pending = FALSE
+                WHERE event_id = ?
+            """,
+                (skeet.event_id,),
             )
 
 
@@ -190,6 +254,12 @@ def format_toot(text: str, url: str, maxlen: int = 500) -> str:
     return "".join([text[:max_text_len].strip(), ellipsis, "\n", url])
 
 
+def truncate(text: str, maxlen: int) -> str:
+    if len(text) > maxlen:
+        text = text[: maxlen - 1] + "…"
+    return text
+
+
 def page_as_toots(content: str, url: str) -> list[PendingToot]:
     html = bs4.BeautifulSoup(content, features="html.parser")
     events = html.find_all("div", id=re.compile(r"en\d+"))
@@ -202,6 +272,21 @@ def page_as_toots(content: str, url: str) -> list[PendingToot]:
             )
         )
     return toots
+
+
+def page_as_skeets(content: str, url: str) -> list[PendingSkeet]:
+    html = bs4.BeautifulSoup(content, features="html.parser")
+    events = html.find_all("div", id=re.compile(r"en\d+"))
+    skeets = []
+    for e in events:
+        skeets.append(
+            PendingSkeet(
+                event_id=e.attrs["id"],
+                content=truncate(extract(e).format(), 300),
+                link=f"{url}#{e.attrs['id']}",
+            )
+        )
+    return skeets
 
 
 app = typer.Typer()
@@ -226,25 +311,53 @@ def scrape(database: Path, ymd: str = todays_date):
         return
     toots = page_as_toots(response.text, url)
     store.save_toots(toots)
+    skeets = page_as_skeets(response.text, url)
+    store.save_skeets(skeets)
     store.record_visit([url])
 
 
 @app.command()
-def toot(database: Path, dry_run: bool = False, secrets: Path = Path("secrets.toml")):
+def toot(
+    database: Path,
+    dry_run: bool = False,
+    secrets: Path = Path("secrets.toml"),
+    post_to_mastodon: bool = typer.Option(True, "--mastodon/--no-mastodon"),
+    post_to_bluesky: bool = typer.Option(True, "--bluesky/--no-bluesky"),
+):
     store = BotStore.from_path(database)
+    secrets_dict = tomllib.loads(secrets.read_text())
+
     toot = store.next_toot()
-    if not toot:
-        return
+    if toot and post_to_mastodon:
+        client = mastodon.Mastodon(**secrets_dict["mastodon"])
+        if dry_run:
+            print(toot.content)
+        else:
+            receipt = client.status_post(toot.content)
+            store.record_toot(toot)
+            print(receipt["url"])
 
-    secrets_dict = tomllib.loads(secrets.read_text())["mastodon"]
-    client = mastodon.Mastodon(**secrets_dict)
-
-    if dry_run:
-        print(toot.content)
-    else:
-        receipt = client.status_post(toot.content)
-        store.record_toot(toot)
-        print(receipt["url"])
+    skeet = store.next_skeet()
+    if skeet and post_to_bluesky:
+        bsky = atproto.Client()
+        bsky.login(
+            secrets_dict["bluesky"]["handle"],
+            secrets_dict["bluesky"]["password"],
+        )
+        card = bsky_card_model.Main(
+            external=bsky_card_model.External(
+                uri=skeet.link,
+                description="US Nuclear Regulatory Commission",
+                title="Event Notifications",
+            )
+        )
+        if dry_run:
+            print(skeet.content)
+            print(card)
+        else:
+            receipt = bsky.send_post(text=skeet.content, embed=card, langs=["en-US"])
+            store.record_skeet(skeet)
+            print(receipt.uri)
 
 
 if __name__ == "__main__":
